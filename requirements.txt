@@ -1,0 +1,6 @@
+python-telegram-bot>=20.0
+PyGithub>=1.58
+gTTS>=2.3
+python-dotenv>=1.0
+openai>=1.0
+requests>=2.28
