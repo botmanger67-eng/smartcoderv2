@@ -1,193 +1,279 @@
+"""
+GitHub Manager module for SmartBot.
+Handles repository operations using PyGithub.
+Fixed: Removed unused GITHUB_USERNAME, better error handling, more features.
+"""
+
 import logging
+import asyncio
 from typing import Optional, List, Dict, Any
 from github import Github, GithubException
 from github.Repository import Repository
-from config import GITHUB_TOKEN, GITHUB_USERNAME
-from database import save_repo, get_repo_by_name
-from utils import validate_repo_name, sanitize_repo_description
 
 logger = logging.getLogger(__name__)
 
-def create_github_repo(
-    repo_name: str,
-    description: str = "",
-    private: bool = False,
-    auto_init: bool = True
-) -> Optional[Dict[str, Any]]:
-    """
-    Create a new GitHub repository for the authenticated user.
 
-    Args:
-        repo_name: Name of the repository (will be validated).
-        description: Short description of the repository.
-        private: Whether the repository should be private.
-        auto_init: Initialize with a README.md.
+class GitHubManager:
+    """Manages GitHub repository operations."""
 
-    Returns:
-        Dictionary with repo info (name, full_name, html_url, clone_url, id)
-        or None if creation fails.
+    def __init__(self, token: Optional[str] = None):
+        """
+        Initialize GitHub manager.
+        
+        Args:
+            token: GitHub personal access token. If None, reads from config.
+        """
+        from config import GITHUB_TOKEN
+        
+        self.token = token or GITHUB_TOKEN
+        self.github: Optional[Github] = None
+        self.user = None
+        
+        if self.token:
+            try:
+                self.github = Github(self.token)
+                self.user = self.github.get_user()
+                logger.info(f"GitHub manager initialized for: {self.user.login}")
+            except GithubException as e:
+                logger.error(f"GitHub auth failed: {e}")
+                self.github = None
+        else:
+            logger.warning("No GitHub token provided. GitHub features disabled.")
 
-    Raises:
-        ValueError: If repo_name is invalid or missing.
-    """
-    try:
-        if not GITHUB_TOKEN:
-            logger.error("GitHub token is not configured")
+    def is_available(self) -> bool:
+        """Check if GitHub integration is available."""
+        return self.github is not None
+
+    async def create_repository(
+        self, 
+        repo_name: str, 
+        description: str = "", 
+        private: bool = False,
+        auto_init: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a new GitHub repository.
+
+        Args:
+            repo_name: Repository name (validated)
+            description: Short description
+            private: Make it private?
+            auto_init: Initialize with README?
+
+        Returns:
+            Repo info dict or None on failure
+        """
+        if not self.is_available():
+            logger.error("GitHub not available")
             return None
 
-        validated_name = validate_repo_name(repo_name)
-        if validated_name is None:
-            logger.error("Invalid repository name: %s", repo_name)
-            return None
-
-        # Check if repo already exists locally (optional)
-        existing = get_repo_by_name(validated_name)
-        if existing:
-            logger.warning("Repository %s already exists in local database", validated_name)
-
-        gh = Github(GITHUB_TOKEN)
-        user = gh.get_user()
         try:
-            repo = user.create_repo(
-                name=validated_name,
-                description=sanitize_repo_description(description),
+            # Validate repo name
+            import re
+            if not re.match(r'^[a-zA-Z0-9._-]+$', repo_name):
+                logger.error(f"Invalid repo name: {repo_name}")
+                return None
+
+            # Create repo
+            repo = await asyncio.to_thread(
+                self.user.create_repo,
+                name=repo_name,
+                description=description[:200] if description else "",
                 private=private,
                 auto_init=auto_init
             )
-        except GithubException as e:
-            logger.error("GitHub API error creating repo %s: %s", validated_name, e.data)
-            return None
 
-        # Save to local database
-        save_repo(
-            repo_id=repo.id,
-            name=repo.name,
-            full_name=repo.full_name,
-            html_url=repo.html_url,
-            clone_url=repo.clone_url,
-            private=repo.private
-        )
+            logger.info(f"Created repo: {repo.full_name}")
 
-        return {
-            "id": repo.id,
-            "name": repo.name,
-            "full_name": repo.full_name,
-            "html_url": repo.html_url,
-            "clone_url": repo.clone_url,
-            "private": repo.private
-        }
+            # Save to database
+            try:
+                from database import save_repo
+                save_repo(
+                    repo_id=repo.id,
+                    name=repo.name,
+                    full_name=repo.full_name,
+                    html_url=repo.html_url,
+                    clone_url=repo.clone_url,
+                    private=repo.private
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save repo to DB: {e}")
 
-    except Exception as e:
-        logger.exception("Unexpected error creating GitHub repo '%s': %s", repo_name, e)
-        return None
-
-def list_user_repos(visibility: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
-    """
-    List all repositories for the authenticated user.
-
-    Args:
-        visibility: Filter by visibility ('all', 'public', 'private', or None for all).
-
-    Returns:
-        List of repo dictionaries or None on failure.
-    """
-    try:
-        if not GITHUB_TOKEN:
-            logger.error("GitHub token is not configured")
-            return None
-
-        gh = Github(GITHUB_TOKEN)
-        user = gh.get_user()
-        repos = user.get_repos(type=visibility or "all")
-
-        repo_list = []
-        for repo in repos:
-            repo_list.append({
+            return {
                 "id": repo.id,
                 "name": repo.name,
                 "full_name": repo.full_name,
                 "html_url": repo.html_url,
-                "private": repo.private,
-                "description": repo.description,
-                "fork": repo.fork
-            })
-        return repo_list
+                "clone_url": repo.clone_url,
+                "private": repo.private
+            }
 
-    except GithubException as e:
-        logger.error("GitHub API error listing repos: %s", e.data)
-        return None
-    except Exception as e:
-        logger.exception("Unexpected error listing GitHub repos: %s", e)
-        return None
-
-def delete_github_repo(repo_name: str) -> bool:
-    """
-    Delete a GitHub repository by its name.
-
-    Args:
-        repo_name: Name of the repository to delete.
-
-    Returns:
-        True if successful, False otherwise.
-    """
-    try:
-        if not GITHUB_TOKEN:
-            logger.error("GitHub token is not configured")
-            return False
-
-        validated_name = validate_repo_name(repo_name)
-        if validated_name is None:
-            logger.error("Invalid repository name: %s", repo_name)
-            return False
-
-        gh = Github(GITHUB_TOKEN)
-        user = gh.get_user()
-        try:
-            repo = user.get_repo(validated_name)
-            repo.delete()
-            logger.info("Deleted repository %s", validated_name)
-            # Remove from local database
-            from database import delete_repo_by_name
-            delete_repo_by_name(validated_name)
-            return True
         except GithubException as e:
-            logger.error("GitHub API error deleting repo %s: %s", validated_name, e.data)
-            return False
-
-    except Exception as e:
-        logger.exception("Unexpected error deleting GitHub repo '%s': %s", repo_name, e)
-        return False
-
-def get_github_user_info() -> Optional[Dict[str, Any]]:
-    """
-    Retrieve authenticated user's GitHub profile information.
-
-    Returns:
-        Dictionary with login, name, email, avatar_url, public_repos, etc.
-    """
-    try:
-        if not GITHUB_TOKEN:
-            logger.error("GitHub token is not configured")
+            logger.error(f"GitHub API error: {e}")
+            if e.status == 422:
+                logger.error("Repo already exists or name taken")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
             return None
 
-        gh = Github(GITHUB_TOKEN)
-        user = gh.get_user()
-        return {
-            "login": user.login,
-            "name": user.name,
-            "email": user.email,
-            "avatar_url": user.avatar_url,
-            "public_repos": user.public_repos,
-            "private_repos": user.owned_private_repos,
-            "total_private_repos": user.total_private_repos,
-            "bio": user.bio,
-            "blog": user.blog,
-            "location": user.location,
-            "html_url": user.html_url
-        }
-    except GithubException as e:
-        logger.error("GitHub API error getting user info: %s", e.data)
-        return None
-    except Exception as e:
-        logger.exception("Unexpected error getting GitHub user info: %s", e)
-        return None
+    async def list_repos(self, visibility: str = "all") -> List[Dict[str, Any]]:
+        """
+        List user's repositories.
+
+        Args:
+            visibility: 'all', 'public', or 'private'
+
+        Returns:
+            List of repo dictionaries
+        """
+        if not self.is_available():
+            return []
+
+        try:
+            repos = await asyncio.to_thread(
+                self.user.get_repos,
+                type=visibility
+            )
+
+            repo_list = []
+            for repo in repos:
+                repo_list.append({
+                    "id": repo.id,
+                    "name": repo.name,
+                    "full_name": repo.full_name,
+                    "html_url": repo.html_url,
+                    "private": repo.private,
+                    "description": repo.description or "",
+                    "language": repo.language or "",
+                    "stars": repo.stargazers_count,
+                    "updated": repo.updated_at.isoformat() if repo.updated_at else ""
+                })
+            
+            return repo_list
+
+        except GithubException as e:
+            logger.error(f"Error listing repos: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return []
+
+    async def get_repo(self, repo_name: str) -> Optional[Dict[str, Any]]:
+        """Get a specific repo by name."""
+        if not self.is_available():
+            return None
+
+        try:
+            full_name = f"{self.user.login}/{repo_name}"
+            repo = await asyncio.to_thread(self.github.get_repo, full_name)
+            
+            return {
+                "id": repo.id,
+                "name": repo.name,
+                "full_name": repo.full_name,
+                "html_url": repo.html_url,
+                "clone_url": repo.clone_url,
+                "private": repo.private,
+                "description": repo.description or "",
+                "language": repo.language or "",
+                "stars": repo.stargazers_count,
+                "forks": repo.forks_count,
+                "open_issues": repo.open_issues_count
+            }
+
+        except GithubException as e:
+            if e.status == 404:
+                logger.warning(f"Repo not found: {repo_name}")
+            else:
+                logger.error(f"Error getting repo: {e}")
+            return None
+
+    async def delete_repo(self, repo_name: str) -> bool:
+        """Delete a repository."""
+        if not self.is_available():
+            return False
+
+        try:
+            full_name = f"{self.user.login}/{repo_name}"
+            repo = await asyncio.to_thread(self.github.get_repo, full_name)
+            await asyncio.to_thread(repo.delete)
+            
+            logger.info(f"Deleted repo: {repo_name}")
+            
+            try:
+                from database import delete_repo_by_name
+                delete_repo_by_name(repo_name)
+            except:
+                pass
+                
+            return True
+
+        except GithubException as e:
+            logger.error(f"Error deleting repo: {e}")
+            return False
+
+    async def push_files(
+        self, 
+        repo_name: str, 
+        files: Dict[str, str], 
+        commit_message: str = "Initial commit"
+    ) -> bool:
+        """
+        Push multiple files to a repository.
+
+        Args:
+            repo_name: Repository name
+            files: Dict of {filepath: content}
+            commit_message: Commit message
+
+        Returns:
+            True if successful
+        """
+        if not self.is_available():
+            return False
+
+        try:
+            full_name = f"{self.user.login}/{repo_name}"
+            repo = await asyncio.to_thread(self.github.get_repo, full_name)
+            
+            for file_path, content in files.items():
+                try:
+                    await asyncio.to_thread(
+                        repo.create_file,
+                        path=file_path,
+                        message=f"Create {file_path}",
+                        content=content,
+                        branch="main"
+                    )
+                    logger.info(f"Created: {file_path}")
+                    await asyncio.sleep(0.3)
+                except GithubException as e:
+                    if e.status == 422:
+                        logger.warning(f"File already exists: {file_path}")
+                    else:
+                        logger.error(f"Failed to push {file_path}: {e}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error pushing files: {e}")
+            return False
+
+    def get_user_info(self) -> Optional[Dict[str, Any]]:
+        """Get authenticated user's info."""
+        if not self.is_available():
+            return None
+
+        try:
+            return {
+                "login": self.user.login,
+                "name": self.user.name or self.user.login,
+                "avatar_url": self.user.avatar_url,
+                "html_url": self.user.html_url,
+                "public_repos": self.user.public_repos,
+                "bio": self.user.bio or ""
+            }
+        except Exception as e:
+            logger.error(f"Error getting user info: {e}")
+            return None
