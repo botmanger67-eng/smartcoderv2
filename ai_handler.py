@@ -1,33 +1,46 @@
 import asyncio
 import json
+import logging
 from typing import Optional, Dict, List, Any
 
 import httpx
-from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
-from database import get_history, save_message, clear_history, get_user_mode
-from github_manager import GitHubManager
-from utils import count_tokens, truncate_history
+from config import (
+    DEEPSEEK_API_KEY, 
+    DEEPSEEK_BASE_URL, 
+    DEEPSEEK_MODEL,
+    DEEPSEEK_MAX_TOKENS,
+    DEEPSEEK_TEMPERATURE
+)
+
+logger = logging.getLogger(__name__)
+
 
 class AIHandler:
     """
     Handles communication with DeepSeek API.
     Maintains conversation history and adapts responses based on user mode.
+    Fixed: Proper API URL, better error handling, full context support.
     """
 
     def __init__(self):
         self.api_key = DEEPSEEK_API_KEY
-        self.base_url = DEEPSEEK_BASE_URL or "https://api.deepseek.com"
+        # ✅ FIXED: Ensure /v1 is in the URL
+        base = DEEPSEEK_BASE_URL or "https://api.deepseek.com"
+        self.base_url = base.rstrip('/') + "/v1"
         self.model = DEEPSEEK_MODEL or "deepseek-chat"
-        self.max_tokens = 4096
+        self.max_tokens = DEEPSEEK_MAX_TOKENS or 4096
+        self.temperature = DEEPSEEK_TEMPERATURE or 0.7
         self.timeout = 60.0
         self._http_client: Optional[httpx.AsyncClient] = None
+        
+        logger.info(f"AI Handler initialized: {self.model} @ {self.base_url}")
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Create or return existing async HTTP client."""
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(
                 base_url=self.base_url,
-                timeout=self.timeout,
+                timeout=httpx.Timeout(self.timeout),
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -39,8 +52,15 @@ class AIHandler:
         """Close the HTTP client."""
         if self._http_client and not self._http_client.is_closed:
             await self._http_client.aclose()
+            self._http_client = None
 
-    async def get_response(self, user_id: int, chat_id: int, message: str) -> str:
+    async def get_response(
+        self, 
+        user_id: int, 
+        chat_id: int, 
+        message: str,
+        context: Optional[Dict] = None
+    ) -> str:
         """
         Get AI response for a given user message.
 
@@ -48,68 +68,81 @@ class AIHandler:
             user_id: Telegram user ID
             chat_id: Telegram chat ID
             message: User message text
+            context: Optional context dict with mode, history, etc.
 
         Returns:
             AI response text
         """
         try:
+            from database import get_conversation_history, save_message, get_user
+
             # Fetch conversation history
-            history = await get_history(user_id, chat_id)
+            history = await asyncio.to_thread(get_conversation_history, user_id)
+            
+            # Get user mode
+            mode = "chat"
+            if context and hasattr(context, 'user_data'):
+                mode = context.user_data.get("mode", "chat")
 
-            # Determine user mode
-            mode = await get_user_mode(user_id)
-
-            # Build system prompt based on mode
-            system_prompt = self._build_system_prompt(mode, user_id, chat_id)
+            # Build system prompt
+            system_prompt = self._build_system_prompt(mode, user_id)
 
             # Build messages array
             messages = [{"role": "system", "content": system_prompt}]
-            for msg in history:
-                messages.append({"role": msg["role"], "content": msg["content"]})
+            
+            # Add last 20 messages for context
+            for msg in history[-20:]:
+                messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+            
+            # Add current message
             messages.append({"role": "user", "content": message})
-
-            # Truncate history if needed to fit token limit
-            max_context_tokens = self.max_tokens - 512  # reserve for response
-            messages = await truncate_history(messages, max_context_tokens, count_tokens)
 
             # Call DeepSeek API
             response_text = await self._call_api(messages)
 
             # Save messages to database
-            await save_message(user_id, chat_id, "user", message)
-            await save_message(user_id, chat_id, "assistant", response_text)
+            await asyncio.to_thread(save_message, user_id, "user", message)
+            await asyncio.to_thread(save_message, user_id, "assistant", response_text)
 
             return response_text
 
         except Exception as e:
-            # Log error (implementation depends on project)
-            print(f"AIHandler error: {e}")
-            return "I'm sorry, I encountered an error while processing your request. Please try again later."
+            logger.error(f"AIHandler error for user {user_id}: {e}", exc_info=True)
+            return "😔 Sorry, main abhi response generate nahi kar pa raha. Kripya thodi der baad try karein."
 
-    def _build_system_prompt(self, mode: str, user_id: int, chat_id: int) -> str:
+    def _build_system_prompt(self, mode: str, user_id: int) -> str:
         """
         Build system prompt based on user mode.
 
         Args:
-            mode: User mode (e.g., 'normal', 'project')
+            mode: User mode ('chat', 'project', 'code')
             user_id: User ID
-            chat_id: Chat ID
 
         Returns:
             System prompt string
         """
         base_prompt = (
-            "You are a multimodal AI assistant integrated with Telegram. "
-            "You have access to the user's conversation history and can remember context. "
-            "Respond helpfully and concisely."
+            "You are SmartBot, a friendly multimodal AI assistant on Telegram. "
+            "You can chat, help with code, create projects, and analyze images/voice. "
+            "Respond in the user's language (Hinglish, Urdu, English, Hindi). "
+            "Be helpful, concise, and warm. "
+            "You have memory of past conversations with this user."
         )
 
         if mode == "project":
-            # Add project-specific context
-            github = GitHubManager()
-            repo_context = github.get_repository_context(user_id, chat_id)
-            if repo_context:
-                base_prompt += f"\n\nCurrent project context:\n{repo_context}"
+            base_prompt += (
+                "\n\n⚠️ PROJECT MODE ACTIVE: "
+                "The user wants to create a project. "
+                "Help them define requirements, suggest file structure, "
+                "and generate code. Ask clarifying questions if needed."
+            )
+        elif mode == "code":
+            base_prompt += (
+                "\n\n💻 CODE MODE ACTIVE: "
+                "The user wants direct code. "
+                "Provide clean, working code with brief explanations. "
+                "Use proper formatting and best practices."
+            )
 
         return base_prompt
 
@@ -122,6 +155,9 @@ class AIHandler:
 
         Returns:
             Response text from the model
+
+        Raises:
+            httpx.HTTPError: On API errors
         """
         client = await self._get_client()
 
@@ -129,50 +165,86 @@ class AIHandler:
             "model": self.model,
             "messages": messages,
             "max_tokens": self.max_tokens,
-            "temperature": 0.7,
+            "temperature": self.temperature,
             "stream": False,
         }
 
         try:
-            response = await client.post("/v1/chat/completions", json=payload)
+            response = await client.post("/chat/completions", json=payload)
             response.raise_for_status()
             data = response.json()
+            
+            if "choices" not in data or len(data["choices"]) == 0:
+                logger.error(f"Unexpected API response: {data}")
+                return "API se unexpected response mila."
+                
             return data["choices"][0]["message"]["content"]
 
         except httpx.HTTPStatusError as e:
-            # Handle specific HTTP errors
+            logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
             if e.response.status_code == 401:
-                return "Invalid API key. Please check your configuration."
+                return "🔑 API key galat hai. Please admin se contact karein."
             elif e.response.status_code == 429:
-                # Rate limit: implement retry logic if needed
-                return "I'm being rate-limited. Please wait a moment and try again."
+                return "⏰ Rate limit reached. Thodi der wait karein."
             elif e.response.status_code == 500:
-                return "DeepSeek API server error. Please try again later."
+                return "🖥️ DeepSeek server error. Baad mein try karein."
+            elif e.response.status_code == 503:
+                return "🔧 DeepSeek under maintenance. Jald wapas aayega."
             else:
-                raise
+                return f"❌ API error {e.response.status_code}. Baad mein try karein."
 
         except httpx.TimeoutException:
-            return "The request timed out. Please try again."
+            logger.error("Request timeout")
+            return "⏰ Request timeout ho gaya. Dobara try karein."
 
         except Exception as e:
-            # Log and re-raise for outer handler
-            print(f"API call failed: {e}")
+            logger.error(f"API call failed: {e}", exc_info=True)
             raise
 
-    async def clear_conversation(self, user_id: int, chat_id: int) -> bool:
+    async def transcribe_audio(self, audio_bytes: bytes) -> Optional[str]:
         """
-        Clear conversation history for a user/chat.
+        Transcribe audio using DeepSeek (if supported).
+        Currently returns placeholder - future implementation.
+        
+        Args:
+            audio_bytes: Audio file bytes
+
+        Returns:
+            Transcribed text or None
+        """
+        # TODO: Implement when DeepSeek adds audio endpoint
+        logger.info("Audio transcription requested (not yet implemented)")
+        return None
+
+    async def analyze_image(self, image_bytes: bytes) -> Optional[str]:
+        """
+        Analyze image using DeepSeek Vision (if supported).
+        Currently returns placeholder - future implementation.
+
+        Args:
+            image_bytes: Image file bytes
+
+        Returns:
+            Image description or None
+        """
+        # TODO: Implement when DeepSeek adds vision endpoint
+        logger.info("Image analysis requested (not yet implemented)")
+        return "🖼️ Image received! (Image analysis coming soon)"
+
+    async def clear_conversation(self, user_id: int) -> bool:
+        """
+        Clear conversation history for a user.
 
         Args:
             user_id: User ID
-            chat_id: Chat ID
 
         Returns:
-            True if successful, False otherwise
+            True if successful
         """
         try:
-            await clear_history(user_id, chat_id)
+            from database import clear_user_history
+            await asyncio.to_thread(clear_user_history, user_id)
             return True
         except Exception as e:
-            print(f"Error clearing history: {e}")
+            logger.error(f"Error clearing history: {e}")
             return False
